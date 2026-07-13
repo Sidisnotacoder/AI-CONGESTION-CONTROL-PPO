@@ -1,5 +1,6 @@
+import logging
 import os
-import re
+import sys
 import time
 from functools import partial
 
@@ -10,66 +11,11 @@ from gymnasium import spaces
 from mininet.net import Mininet
 from mininet.node import OVSSwitch
 from mininet.link import TCLink
-from mininet.topo import Topo
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.network import BottleneckTopo, parse_ss_output, wait_for_estab_socket, FAIL_MODE
 
-class BottleneckTopo(Topo):
-    def build(self, bw=10, delay="20ms"):
-        h1 = self.addHost("h1")
-        h2 = self.addHost("h2")
-        h3 = self.addHost("h3")
-        s1 = self.addSwitch("s1")
-        s2 = self.addSwitch("s2")
-        self.addLink(h1, s1)
-        self.addLink(h2, s1)
-        self.addLink(h3, s2)
-        self.addLink(s1, s2, bw=bw, delay=delay)
-
-
-def parse_ss_output(output):
-    """Return (rtt_ms, cwnd, throughput_mbps, loss_pct) for the ESTAB
-    socket actually carrying data (largest bytes_sent). ss -ti reports
-    more than one socket per iperf3 run (control channel + data
-    stream); mixing fields across sockets pairs the wrong values
-    together, so every field here comes from the same block. Same
-    parser as scripts/collect_dataset.py, validated against a live
-    Mininet bottleneck topology."""
-    blocks = re.split(r"\n(?=\S)", output)
-    estab_blocks = [b for b in blocks if b.startswith("ESTAB")]
-    if not estab_blocks:
-        return None
-
-    def bytes_sent_of(block):
-        m = re.search(r"bytes_sent:(\d+)", block)
-        return int(m.group(1)) if m else -1
-
-    block = max(estab_blocks, key=bytes_sent_of)
-    if bytes_sent_of(block) <= 0:
-        return None
-
-    rtt_match = re.search(r"rtt:(\d+\.\d+)", block)
-    cwnd_match = re.search(r"cwnd:(\d+)", block)
-    rate_match = re.search(r"delivery_rate\s+([\d.]+)([KMGkmg]?)bps", block)
-    segs_match = re.search(r"segs_out:(\d+)", block)
-    retrans_match = re.search(r"retrans:\d+/(\d+)", block)
-
-    unit_to_mbps = {"": 1e-6, "K": 1e-3, "M": 1, "G": 1e3}
-
-    rtt = float(rtt_match.group(1)) if rtt_match else 0
-    cwnd = int(cwnd_match.group(1)) if cwnd_match else 0
-    throughput = (
-        float(rate_match.group(1)) * unit_to_mbps[rate_match.group(2).upper()]
-        if rate_match else 0
-    )
-
-    loss_pct = 0.0
-    if retrans_match and segs_match:
-        segs_out = int(segs_match.group(1))
-        total_retrans = int(retrans_match.group(1))
-        if segs_out > 0:
-            loss_pct = 100.0 * total_retrans / segs_out
-
-    return rtt, cwnd, throughput, loss_pct
+logger = logging.getLogger(__name__)
 
 
 class RealCongestionEnv(gym.Env):
@@ -123,18 +69,25 @@ class RealCongestionEnv(gym.Env):
         self.net = Mininet(
             topo=BottleneckTopo(),
             link=TCLink,
-            switch=partial(OVSSwitch, failMode="standalone"),
+            switch=partial(OVSSwitch, failMode=FAIL_MODE),
             controller=None,
         )
-        self.net.start()
+        try:
+            self.net.start()
 
-        loss = self.net.pingAll()
-        if loss >= 100:
+            loss = self.net.pingAll()
+            if loss >= 100:
+                raise RuntimeError("No connectivity in RealCongestionEnv topology.")
+
+            self.h1 = self.net.get("h1")
+            self.h3 = self.net.get("h3")
+        except Exception:
+            # Anything going wrong after net.start() (pingAll failure,
+            # or any future addition to this block) must not leak a
+            # live Mininet network/OVS bridges -- tear it down before
+            # propagating, same as the explicit pingAll path already did.
             self.net.stop()
-            raise RuntimeError("No connectivity in RealCongestionEnv topology.")
-
-        self.h1 = self.net.get("h1")
-        self.h3 = self.net.get("h3")
+            raise
 
         self.rate_mbps = float(self.START_RATE_MBPS)
         self.step_count = 0
@@ -153,7 +106,12 @@ class RealCongestionEnv(gym.Env):
             f"iperf3 -c {self.h3.IP()} -p {self.SERVER_PORT} "
             f"-t {duration} > /tmp/real_env_client.log 2>&1 &"
         )
-        time.sleep(1)  # let TCP handshake complete before the first sample
+        # Bounded readiness poll instead of a flat sleep: returns as
+        # soon as the handshake is actually done (usually much faster
+        # than 1s), falls back to that same 1s wait if it never
+        # converges within the timeout (never hangs indefinitely).
+        if not wait_for_estab_socket(self.h1, timeout=1.0):
+            time.sleep(1)
 
     def _apply_rate(self):
         intf = self.h1.intfList()[0]
@@ -162,6 +120,16 @@ class RealCongestionEnv(gym.Env):
     def _sample_state(self):
         parsed = parse_ss_output(self.h1.cmd("ss -ti"))
         if parsed is None:
+            # parse_ss_output already logged the raw output that
+            # failed to parse; the zero-state fallback below is a
+            # last resort to keep step() returning a valid observation,
+            # not a legitimate "throughput dropped to zero" reading --
+            # log it here too so a broken monitoring pipeline is
+            # visible in this env's own step count, not just once.
+            logger.warning(
+                "step %d: no data-carrying ESTAB socket found, "
+                "returning zero-state observation", self.step_count
+            )
             return np.array([0, 0, 0], dtype=np.float32), 0.0
         rtt, cwnd, throughput, loss_pct = parsed
         return np.array([rtt, cwnd, throughput], dtype=np.float32), loss_pct
@@ -176,8 +144,8 @@ class RealCongestionEnv(gym.Env):
         self._apply_rate()
         self._restart_client()
 
-        state, _ = self._sample_state()
-        return state, {}
+        state, loss_pct = self._sample_state()
+        return state, {"loss_pct": loss_pct}
 
     def step(self, action):
         if action == 0:
@@ -191,17 +159,32 @@ class RealCongestionEnv(gym.Env):
         rtt, cwnd, throughput = state
 
         # Reward = throughput - loss penalty - latency penalty
-        # (Section 8 of the project plan).
-        reward = float(throughput) - 2.0 * loss_pct - (float(rtt) / 100.0)
+        # (Section 8 of the project plan). Each term is also kept
+        # separately in reward_components so callers (evaluate_real.py,
+        # the dashboard) can show *why* a given reward was earned
+        # instead of just the summed total.
+        throughput_term = float(throughput)
+        loss_term = -2.0 * loss_pct
+        rtt_term = -(float(rtt) / 100.0)
+        reward = throughput_term + loss_term + rtt_term
 
         self.step_count += 1
         terminated = False
         truncated = self.step_count >= self.MAX_STEPS_PER_EPISODE
 
-        return state, reward, terminated, truncated, {"rate_mbps": self.rate_mbps}
+        info = {
+            "rate_mbps": self.rate_mbps,
+            "loss_pct": loss_pct,
+            "reward_components": {
+                "throughput": throughput_term,
+                "loss_penalty": loss_term,
+                "rtt_penalty": rtt_term,
+            },
+        }
+        return state, reward, terminated, truncated, info
 
     def render(self):
-        print(self.rate_mbps)
+        logger.info("current rate_mbps=%s", self.rate_mbps)
 
     def close(self):
         self.h1.cmd("pkill -9 -f 'iperf3 -c'")

@@ -1,6 +1,7 @@
+import logging
 import os
-import re
 import csv
+import sys
 import time
 from functools import partial
 from datetime import datetime
@@ -8,7 +9,6 @@ from datetime import datetime
 from mininet.net import Mininet
 from mininet.node import OVSSwitch
 from mininet.link import TCLink
-from mininet.topo import Topo
 
 if os.geteuid() != 0:
     raise SystemExit(
@@ -21,11 +21,21 @@ if os.geteuid() != 0:
 # (a relative "../data/..." silently wrote outside the project
 # entirely when run from the wrong directory).
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PROJECT_ROOT)
+from common.network import BottleneckTopo, parse_ss_output, wait_for_estab_socket, configure_logging, FAIL_MODE
+
 CSV_FILE = os.path.join(_PROJECT_ROOT, "data", "raw", "network_metrics.csv")
 
+configure_logging()
+logger = logging.getLogger(__name__)
+
 # How often to sample each active sender (seconds). Matches the
-# project plan's ~100ms sampling target.
-SAMPLE_INTERVAL = 0.1
+# project plan's ~100ms sampling target. Override with
+# CNP_SAMPLE_INTERVAL for a quick smoke test instead of hand-editing
+# this file (e.g. CNP_SAMPLE_INTERVAL=0.5 CNP_SCENARIO_DURATION=30
+# sudo -E python3 scripts/collect_dataset.py).
+SAMPLE_INTERVAL = float(os.environ.get("CNP_SAMPLE_INTERVAL", 0.1))
+_SCENARIO_DURATION_OVERRIDE = os.environ.get("CNP_SCENARIO_DURATION")
 
 # Traffic scenarios (Section 5 of the project plan): baseline/medium/high
 # load plus a bursty pattern, all crossing the s1<->s2 bottleneck link
@@ -39,12 +49,13 @@ SAMPLE_INTERVAL = 0.1
 #
 # duration=1500s per scenario (~25 min each, ~100 min total) targets
 # ~85k total rows, close to the plan's ~100k-sample goal. For a quick
-# smoke test instead, drop duration to 30 and SAMPLE_INTERVAL to 0.5.
+# smoke test instead, set CNP_SCENARIO_DURATION=30 CNP_SAMPLE_INTERVAL=0.5.
+_DEFAULT_DURATION = int(_SCENARIO_DURATION_OVERRIDE) if _SCENARIO_DURATION_OVERRIDE else 1500
 SCENARIOS = [
-    {"name": "baseline_low", "senders": ["h1"],       "duration": 1500, "uplink_bw_mbps": 2,   "pattern": "steady"},
-    {"name": "medium_load",  "senders": ["h1", "h2"], "duration": 1500, "uplink_bw_mbps": 6,   "pattern": "steady"},
-    {"name": "high_load",    "senders": ["h1", "h2"], "duration": 1500, "uplink_bw_mbps": 50,  "pattern": "steady"},
-    {"name": "bursty",       "senders": ["h1"],       "duration": 1500, "uplink_bw_mbps": 100, "pattern": "bursty"},
+    {"name": "baseline_low", "senders": ["h1"],       "duration": _DEFAULT_DURATION, "uplink_bw_mbps": 2,   "pattern": "steady"},
+    {"name": "medium_load",  "senders": ["h1", "h2"], "duration": _DEFAULT_DURATION, "uplink_bw_mbps": 6,   "pattern": "steady"},
+    {"name": "high_load",    "senders": ["h1", "h2"], "duration": _DEFAULT_DURATION, "uplink_bw_mbps": 50,  "pattern": "steady"},
+    {"name": "bursty",       "senders": ["h1"],       "duration": _DEFAULT_DURATION, "uplink_bw_mbps": 100, "pattern": "bursty"},
 ]
 
 # iperf3's server handles one client at a time by default, so
@@ -52,63 +63,6 @@ SCENARIOS = [
 # port per sender -- otherwise the second client's connection just
 # queues behind the first and there's no real contention on the link.
 SENDER_PORTS = {"h1": 5201, "h2": 5202}
-
-
-class BottleneckTopo(Topo):
-    def build(self, bw=10, delay="20ms"):
-        h1 = self.addHost("h1")
-        h2 = self.addHost("h2")
-        h3 = self.addHost("h3")
-        s1 = self.addSwitch("s1")
-        s2 = self.addSwitch("s2")
-        self.addLink(h1, s1)
-        self.addLink(h2, s1)
-        self.addLink(h3, s2)
-        self.addLink(s1, s2, bw=bw, delay=delay)
-
-
-def parse_ss_output(output):
-    """Return (rtt_ms, cwnd, throughput_mbps, loss_pct) for the ESTAB
-    socket actually carrying data (largest bytes_sent). ss -ti reports
-    more than one socket per iperf3 run (control channel + data
-    stream); mixing fields across sockets pairs the wrong values
-    together, so every field here comes from the same block."""
-    blocks = re.split(r"\n(?=\S)", output)
-    estab_blocks = [b for b in blocks if b.startswith("ESTAB")]
-    if not estab_blocks:
-        return None
-
-    def bytes_sent_of(block):
-        m = re.search(r"bytes_sent:(\d+)", block)
-        return int(m.group(1)) if m else -1
-
-    block = max(estab_blocks, key=bytes_sent_of)
-    if bytes_sent_of(block) <= 0:
-        return None
-
-    rtt_match = re.search(r"rtt:(\d+\.\d+)", block)
-    cwnd_match = re.search(r"cwnd:(\d+)", block)
-    rate_match = re.search(r"delivery_rate\s+([\d.]+)([KMGkmg]?)bps", block)
-    segs_match = re.search(r"segs_out:(\d+)", block)
-    retrans_match = re.search(r"retrans:\d+/(\d+)", block)
-
-    unit_to_mbps = {"": 1e-6, "K": 1e-3, "M": 1, "G": 1e3}
-
-    rtt = float(rtt_match.group(1)) if rtt_match else 0
-    cwnd = int(cwnd_match.group(1)) if cwnd_match else 0
-    throughput = (
-        float(rate_match.group(1)) * unit_to_mbps[rate_match.group(2).upper()]
-        if rate_match else 0
-    )
-
-    loss_pct = 0.0
-    if retrans_match and segs_match:
-        segs_out = int(segs_match.group(1))
-        total_retrans = int(retrans_match.group(1))
-        if segs_out > 0:
-            loss_pct = 100.0 * total_retrans / segs_out
-
-    return rtt, cwnd, throughput, loss_pct
 
 
 def set_uplink_bw(host, bw_mbps):
@@ -123,6 +77,15 @@ def sample_hosts(writer, scenario_name, hosts):
     for h in hosts:
         parsed = parse_ss_output(h.cmd("ss -ti"))
         if parsed is None:
+            # parse_ss_output already logged the raw output; also flag
+            # it here with scenario/host context since a whole host
+            # silently producing zero rows for a scenario has bitten
+            # this pipeline before (see run_steady's server-restart
+            # comment below).
+            logger.warning(
+                "scenario=%s host=%s: skipping sample, no parseable ESTAB socket",
+                scenario_name, h.name,
+            )
             continue
         rtt, cwnd, throughput, loss_pct = parsed
         writer.writerow([
@@ -143,7 +106,11 @@ def run_steady(writer, scenario, h3, sender_hosts):
             f"-t {scenario['duration'] + 5} "
             f"> /tmp/iperf_{h.name}_{scenario['name']}.log 2>&1 &"
         )
-    time.sleep(1)  # let TCP handshake complete before sampling
+    # Bounded readiness poll instead of a flat sleep: returns as soon
+    # as every sender's handshake is actually done, falls back to the
+    # same 1s wait if any host doesn't converge within the timeout.
+    if not all(wait_for_estab_socket(h, timeout=1.0) for h in sender_hosts):
+        time.sleep(1)
 
     # Step-counted rather than wall-clock-deadline-based: if the
     # machine suspends/sleeps mid-run, time.time() jumps forward on
@@ -202,7 +169,7 @@ def main():
     net = Mininet(
         topo=topo,
         link=TCLink,
-        switch=partial(OVSSwitch, failMode="standalone"),
+        switch=partial(OVSSwitch, failMode=FAIL_MODE),
         controller=None,
     )
     net.start()
@@ -212,7 +179,7 @@ def main():
     # in earlier testing; skipping it left connections failing with
     # "unable to send control message: Bad file descriptor".
     loss = net.pingAll()
-    print(f"pingAll loss: {loss}%")
+    logger.info("pingAll loss: %s%%", loss)
     if loss >= 100:
         net.stop()
         raise SystemExit("No connectivity between hosts -- aborting before collecting garbage data.")
@@ -230,8 +197,10 @@ def main():
             h3 = net.get("h3")
 
             for scenario in SCENARIOS:
-                print(f"=== Scenario: {scenario['name']} "
-                      f"({scenario['duration']}s, {scenario['pattern']}) ===")
+                logger.info(
+                    "=== Scenario: %s (%ds, %s) ===",
+                    scenario["name"], scenario["duration"], scenario["pattern"],
+                )
                 sender_hosts = [net.get(name) for name in scenario["senders"]]
 
                 # Restart the server(s) fresh for every scenario. A
@@ -253,15 +222,15 @@ def main():
                     run_steady(writer, scenario, h3, sender_hosts)
 
                 f.flush()
-                print(f"    done.")
+                logger.info("    done.")
 
             h3.cmd("pkill -9 iperf3")
     except KeyboardInterrupt:
-        print("\nInterrupted -- stopping network.")
+        logger.warning("Interrupted -- stopping network.")
     finally:
         net.stop()
 
-    print("Dataset collection complete ->", CSV_FILE)
+    logger.info("Dataset collection complete -> %s", CSV_FILE)
 
 
 if __name__ == "__main__":

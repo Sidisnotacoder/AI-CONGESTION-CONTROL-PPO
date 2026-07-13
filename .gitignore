@@ -10,3 +10,16 @@ data/processed/*.csv
 # iperf3/tc scratch logs written by collect_dataset.py / real_congestion_env.py
 /tmp/iperf_*.log
 /tmp/real_env_client.log
+
+# Tensorboard event files from PPO(tensorboard_log=...) -- one directory
+# per training run, regenerable by re-running rl/train.py / train_real.py.
+results/tb_logs/
+
+# Timestamped model snapshots written by rl/model_registry.save_versioned()
+# on every training run -- a local provenance record (paired with a sidecar
+# .json of hyperparams + git commit hash), not meant to accumulate in the
+# shared repo. The fixed models/*.zip path each loader actually reads from
+# (evaluate_real.py, evaluate_multi_trial.py, dashboard/backend.py) is
+# still tracked as before.
+models/*_[0-9]*T*Z.zip
+models/*_[0-9]*T*Z.json
