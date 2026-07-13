@@ -1,16 +1,20 @@
-"""Live-mode SSE server for the dashboard.
+"""Live-mode SSE + control server for the dashboard.
 
 Must be launched with `sudo python3 dashboard/backend.py` from an
-interactive terminal -- RealCongestionEnv needs root for Mininet, and
-this environment has no NOPASSWD sudo (confirmed during project
-setup), so it cannot elevate itself or be started headlessly. Binds to
-127.0.0.1 only; the frontend (dashboard/static/dashboard.html) is
-served from this same process, so there's no CORS to configure.
+interactive terminal -- MultiFlowCongestionEnv needs root for Mininet, and
+this environment has no NOPASSWD sudo (confirmed during project setup), so
+it cannot elevate itself or be started headlessly. Binds to 127.0.0.1 only;
+the frontend (dashboard/static/dashboard.html) is served from this same
+process, so there's no CORS to configure.
 
-Only one live episode may run at a time (a second Mininet network
-can't safely coexist with the first) -- a `/stream` request made while
-one is already in flight gets HTTP 409, not a silently queued second
-network.
+Only one live session may run at a time (a second Mininet network can't
+safely coexist with the first) -- a `/live/start` request made while one is
+already in flight gets HTTP 409, not a silently queued second network.
+
+Replaces the earlier single-arm `/stream?run=...` endpoint: that endpoint's
+three fixed policies are now just the n_senders=1 special case of the
+general session below (e.g. policies=["ppo"]), so there is exactly one live
+code path instead of two that could drift apart.
 """
 
 import json
@@ -24,10 +28,9 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stable_baselines3 import PPO
-from env.real_congestion_env import RealCongestionEnv
-from rl.policy_utils import predict_with_distribution, predict_hybrid
 from rl.regime_classifier import RegimeModel
-from common.network import configure_logging
+from common.network import configure_logging, MAX_SENDERS
+from dashboard.live_session import LiveSession, VALID_POLICIES
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -40,6 +43,7 @@ _episode_lock = threading.Lock()
 
 _model = None
 _regime_model = None
+_session = None  # the one active LiveSession, or None between/before sessions
 
 
 def _get_model():
@@ -56,6 +60,17 @@ def _get_regime_model():
     return _regime_model
 
 
+def _on_session_finished():
+    """Called from the session's own background thread once its episode
+    is truly over (natural end, error, or explicit stop) -- the single
+    place that clears _session and frees the one-network-at-a-time lock,
+    so callers of /live/stop don't also need to release it themselves."""
+    global _session
+    _session = None
+    if _episode_lock.locked():
+        _episode_lock.release()
+
+
 @app.route("/")
 def index():
     return send_from_directory(STATIC_DIR, "dashboard.html")
@@ -66,95 +81,112 @@ def replay_data():
     return send_from_directory(STATIC_DIR, "replay_data.json")
 
 
-def _row_for_step(step, obs, reward, info, action, extra):
-    rtt, cwnd, throughput = obs
-    components = info.get("reward_components", {})
-    return {
-        "step": step, "rtt_ms": float(rtt), "cwnd": float(cwnd), "throughput_mbps": float(throughput),
-        "reward": float(reward), "rate_mbps": info.get("rate_mbps"),
-        "action": action,
-        "prob_decrease": extra.get("prob_decrease"), "prob_maintain": extra.get("prob_maintain"),
-        "prob_increase": extra.get("prob_increase"), "value_estimate": extra.get("value_estimate"),
-        "reward_throughput_term": components.get("throughput"),
-        "reward_loss_term": components.get("loss_penalty"),
-        "reward_rtt_term": components.get("rtt_penalty"),
-        "regime_predicted_class": extra.get("regime_predicted_class"),
-        "regime_confidence": extra.get("regime_confidence"),
-        "tree_direction": extra.get("tree_direction"),
-    }
+@app.route("/live/start", methods=["POST"])
+def live_start():
+    global _session
+    body = request.get_json(force=True, silent=True) or {}
 
+    n_senders = body.get("n_senders")
+    policies = body.get("policies")
+    bw = body.get("bw", 10)
+    delay = body.get("delay", "20ms")
+    queue_size = body.get("queue_size")
+    max_steps = body.get("max_steps", 40)
+    queue_disc = body.get("queue_disc", "fifo")
 
-def _regime_extra(regime_model, obs, loss_pct):
-    if regime_model is None:
-        return {}
-    import numpy as np
-    features = np.concatenate([np.asarray(obs, dtype=np.float32), [loss_pct]])
-    probs = regime_model.regime_probs(features)
-    top = int(np.argmax(probs))
-    return {"regime_predicted_class": regime_model.classes[top], "regime_confidence": float(probs[top])}
-
-
-def _run_live_episode(run_name):
-    """Generator yielding SSE-formatted strings for one live episode."""
-    model = _get_model()
-    regime_model = _get_regime_model()
-
-    if run_name == "cubic_baseline":
-        env = RealCongestionEnv(start_rate_mbps=100)
-    else:
-        env = RealCongestionEnv()
-
-    try:
-        obs, info = env.reset()
-        step = 0
-        terminated = truncated = False
-        while not (terminated or truncated):
-            loss_pct = info.get("loss_pct", 0.0)
-
-            if run_name == "ppo_agent":
-                action, probs, value = predict_with_distribution(model, obs)
-                extra = {"prob_decrease": probs[0], "prob_maintain": probs[1], "prob_increase": probs[2], "value_estimate": value}
-                extra.update(_regime_extra(regime_model, obs, loss_pct))
-            elif run_name == "ppo_hybrid_tree":
-                if regime_model is None:
-                    raise RuntimeError("regime classifier not trained -- run scripts/train_regime_classifier.py")
-                action, blended_probs, _, tree_direction = predict_hybrid(model, regime_model, obs, loss_pct)
-                extra = {"prob_decrease": blended_probs[0], "prob_maintain": blended_probs[1], "prob_increase": blended_probs[2], "tree_direction": tree_direction}
-                extra.update(_regime_extra(regime_model, obs, loss_pct))
-            elif run_name == "cubic_baseline":
-                action, extra = 1, {}
-            else:
-                raise ValueError(f"unknown run: {run_name}")
-
-            obs, reward, terminated, truncated, info = env.step(action)
-            row = _row_for_step(step, obs, reward, info, action, extra)
-            yield f"data: {json.dumps(row)}\n\n"
-            step += 1
-
-        yield "event: done\ndata: {}\n\n"
-    except Exception as e:
-        logger.exception("live episode failed")
-        yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
-    finally:
-        env.close()
-
-
-@app.route("/stream")
-def stream():
-    run_name = request.args.get("run", "ppo_agent")
-    if run_name not in ("ppo_agent", "ppo_hybrid_tree", "cubic_baseline"):
-        return jsonify({"error": f"unknown run {run_name}"}), 400
+    if not isinstance(n_senders, int) or not (1 <= n_senders <= MAX_SENDERS):
+        return jsonify({"error": f"n_senders must be an int between 1 and {MAX_SENDERS}"}), 400
+    if not isinstance(policies, list) or len(policies) != n_senders:
+        return jsonify({"error": "policies must be a list with exactly n_senders entries"}), 400
+    if any(p not in VALID_POLICIES for p in policies):
+        return jsonify({"error": f"each policy must be one of {VALID_POLICIES}"}), 400
+    if queue_disc not in ("fifo", "red"):
+        return jsonify({"error": "queue_disc must be 'fifo' or 'red'"}), 400
 
     if not _episode_lock.acquire(blocking=False):
-        return jsonify({"error": "a live episode is already running -- only one Mininet network can exist at a time"}), 409
+        return jsonify({"error": "a live session is already running -- only one Mininet network can exist at a time"}), 409
+
+    try:
+        session = LiveSession(
+            n_senders=n_senders, policies=policies, bw=bw, delay=delay,
+            queue_size=queue_size, max_steps=max_steps, queue_disc=queue_disc,
+            model=_get_model(), regime_model=_get_regime_model(),
+            on_finished=_on_session_finished,
+        )
+    except Exception as e:
+        _episode_lock.release()
+        logger.exception("failed to start live session")
+        return jsonify({"error": str(e)}), 400
+
+    _session = session
+    _session.start()
+    return jsonify({
+        "status": "started",
+        "senders": [{"id": i, "policy": p} for i, p in enumerate(policies)],
+    })
+
+
+@app.route("/live/stream")
+def live_stream():
+    session = _session
+    if session is None:
+        return jsonify({"error": "no live session running -- call POST /live/start first"}), 404
 
     def generate():
-        try:
-            yield from _run_live_episode(run_name)
-        finally:
-            _episode_lock.release()
+        while True:
+            row = session.row_queue.get()
+            event = row.pop("__event__", None)
+            if event == "done":
+                yield "event: done\ndata: {}\n\n"
+                break
+            elif event == "error":
+                yield f"event: error\ndata: {json.dumps({'message': row.get('message')})}\n\n"
+                break
+            else:
+                yield f"data: {json.dumps(row)}\n\n"
 
     return Response(generate(), mimetype="text/event-stream")
+
+
+@app.route("/live/control", methods=["POST"])
+def live_control():
+    session = _session
+    if session is None:
+        return jsonify({"error": "no live session running"}), 404
+
+    body = request.get_json(force=True, silent=True) or {}
+    ctrl_type = body.get("type")
+
+    try:
+        if ctrl_type == "bandwidth":
+            session.set_bandwidth(float(body["value"]))
+        elif ctrl_type == "delay":
+            session.set_delay(str(body["value"]))
+        elif ctrl_type == "queue_disc":
+            value = body.get("value")
+            if value not in ("fifo", "red"):
+                return jsonify({"error": "queue_disc value must be 'fifo' or 'red'"}), 400
+            session.set_queue_disc(value)
+        elif ctrl_type == "burst":
+            session.inject_burst(float(body.get("duration", 4)), float(body.get("rate_mbps", 8)))
+        elif ctrl_type == "human_action":
+            session.set_human_action(int(body["sender_id"]), int(body["action"]))
+        else:
+            return jsonify({"error": f"unknown control type {ctrl_type!r}"}), 400
+    except (KeyError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    return jsonify({"status": "ok"})
+
+
+@app.route("/live/stop", methods=["POST"])
+def live_stop():
+    session = _session
+    if session is None:
+        return jsonify({"error": "no live session running"}), 404
+    session.stop()
+    session.join(timeout=10)
+    return jsonify({"status": "stopped"})
 
 
 if __name__ == "__main__":

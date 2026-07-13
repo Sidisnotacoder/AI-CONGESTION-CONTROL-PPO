@@ -21,61 +21,25 @@ DASHBOARD_OUT = os.path.join(_HERE, "static", "dashboard.html")
 ARTIFACT_OUT = os.path.join(_HERE, "static", "replay_artifact.html")
 
 DASHBOARD_LOADER = """
+const LIVE_ENABLED = true;
+
 function loadInitialData() {
   fetch('/replay-data.json').then(r => r.json()).then(data => {
     DATA = data;
     init();
-    document.getElementById('liveBtn').addEventListener('click', startLive);
   }).catch(err => {
     document.getElementById('liveStatus').textContent = 'Failed to load replay data: ' + err;
-  });
-}
-
-let liveSource = null;
-
-function startLive() {
-  if (liveSource) { liveSource.close(); liveSource = null; }
-  const run = state.run || Object.keys(DATA.runs)[0];
-  document.getElementById('liveStatus').innerHTML = '<span class="live-dot"></span> connecting...';
-  document.getElementById('liveBtn').disabled = true;
-  DATA.runs[run] = [];
-  state.stepIndex = 0;
-  liveSource = new EventSource('/stream?run=' + encodeURIComponent(run));
-  liveSource.onmessage = (e) => {
-    const row = JSON.parse(e.data);
-    DATA.runs[run].push(row);
-    state.stepIndex = DATA.runs[run].length - 1;
-    render();
-    document.getElementById('liveStatus').innerHTML = '<span class="live-dot"></span> live: step ' + state.stepIndex;
-  };
-  liveSource.addEventListener('done', () => {
-    liveSource.close();
-    liveSource = null;
-    document.getElementById('liveBtn').disabled = false;
-    document.getElementById('liveStatus').textContent = 'live run complete';
-  });
-  liveSource.addEventListener('error', () => {
-    if (liveSource) { liveSource.close(); }
-    liveSource = null;
-    document.getElementById('liveBtn').disabled = false;
-    document.getElementById('liveStatus').textContent = 'live run failed -- showing replay data instead';
-    // Fall back to replay data in-browser rather than hanging or
-    // ending the demo mid-presentation.
-    fetch('/replay-data.json').then(r => r.json()).then(data => {
-      DATA.runs[run] = data.runs[run] || [];
-      render();
-    });
   });
 }
 """
 
 ARTIFACT_LOADER_TEMPLATE = """
+const LIVE_ENABLED = false;
 const REPLAY_DATA = %s;
 
 function loadInitialData() {
   DATA = REPLAY_DATA;
   init();
-  document.getElementById('liveBtn').style.display = 'none';
 }
 """
 

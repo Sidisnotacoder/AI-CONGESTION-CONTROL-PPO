@@ -75,6 +75,47 @@ class BottleneckTopo(Topo):
         self.addLink(s1, s2, bw=bw, delay=delay)
 
 
+MAX_SENDERS = 4
+
+
+class MultiSenderTopo(Topo):
+    """N sender hosts (sender0..senderN-1) + one always-present, idle-until-
+    used `burst` host, all on s1; one shared `receiver` on s2; the same
+    s1<->s2 bottleneck link as BottleneckTopo, with an added optional
+    `queue_size` (-> TCLink's max_queue_size, the actual lever behind
+    bufferbloat). Because each sender is its own Mininet host/netns,
+    `parse_ss_output(sender.cmd("ss -ti"))` naturally returns only that
+    sender's own sockets -- running several senders that share this one
+    bottleneck needs no per-flow disambiguation beyond what already exists.
+
+    Used by MultiFlowCongestionEnv for live multi-policy sessions.
+    BottleneckTopo (single sender) is untouched and still used by
+    RealCongestionEnv / scripts/collect_dataset.py.
+    """
+
+    def build(self, n_senders=2, bw=10, delay="20ms", queue_size=None):
+        if not (1 <= n_senders <= MAX_SENDERS):
+            raise ValueError(f"n_senders must be between 1 and {MAX_SENDERS}, got {n_senders}")
+
+        s1 = self.addSwitch("s1")
+        s2 = self.addSwitch("s2")
+
+        for i in range(n_senders):
+            sender = self.addHost(f"sender{i}")
+            self.addLink(sender, s1)
+
+        burst = self.addHost("burst")
+        self.addLink(burst, s1)
+
+        receiver = self.addHost("receiver")
+        self.addLink(receiver, s2)
+
+        link_opts = {"bw": bw, "delay": delay}
+        if queue_size is not None:
+            link_opts["max_queue_size"] = queue_size
+        self.addLink(s1, s2, **link_opts)
+
+
 def parse_ss_output(output):
     """Return (rtt_ms, cwnd, throughput_mbps, loss_pct) for the ESTAB
     socket actually carrying data (largest bytes_sent). ss -ti reports
