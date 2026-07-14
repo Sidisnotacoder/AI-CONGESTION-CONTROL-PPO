@@ -878,7 +878,15 @@ function renderTopologyDiagram(frame, opts) {
       <text x="${senderX+senderW/2}" y="${y-3}" text-anchor="middle">sender${f.id}</text>
       <text x="${senderX+senderW/2}" y="${y+9}" text-anchor="middle" fill="${color}">${f.policy}</text></g>`;
 
-    const path = `M${senderX+senderW},${y} C${s1X-20},${y} ${s1X-10},110 ${s1X},110 L${s2X+40},110 C${s2X+50},110 ${receiverX-20},${y} ${receiverX},${y}`;
+    // Every flow's path used to converge to the exact same (x,110)
+    // coordinates through the bottleneck -- with N overlapping paths drawn
+    // in the same spot, only the last-drawn one (highest sender index) was
+    // ever visible there, making the whole shared segment misleadingly
+    // look like a single flow's color. A small per-sender lane offset keeps
+    // them visually distinguishable as parallel lanes through the
+    // bottleneck instead of one flow fully occluding the others.
+    const midY = 110 + (i - (n - 1) / 2) * Math.min(5, 16 / n);
+    const path = `M${senderX+senderW},${y} C${s1X-20},${y} ${s1X-10},${midY} ${s1X},${midY} L${s2X+40},${midY} C${s2X+50},${midY} ${receiverX-20},${y} ${receiverX},${y}`;
     html += `<path class="topo-flow-line animated" d="${path}" stroke="${color}" stroke-width="${strokeWidth}" style="animation-duration:${duration}s" opacity="0.85"/>`;
   });
 
