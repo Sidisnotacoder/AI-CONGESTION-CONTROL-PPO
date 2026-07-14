@@ -13,23 +13,10 @@ import logging
 import queue
 import threading
 
-import numpy as np
-
 from env.multi_flow_congestion_env import MultiFlowCongestionEnv
-from rl.policy_utils import predict_with_distribution, predict_hybrid
+from rl.policy_utils import VALID_POLICIES, resolve_action
 
 logger = logging.getLogger(__name__)
-
-VALID_POLICIES = ("ppo", "hybrid", "cubic", "human")
-
-
-def _regime_extra(regime_model, obs, loss_pct):
-    if regime_model is None:
-        return {}
-    features = np.concatenate([np.asarray(obs, dtype=np.float32), [loss_pct]])
-    probs = regime_model.regime_probs(features)
-    top = int(np.argmax(probs))
-    return {"regime_predicted_class": regime_model.classes[top], "regime_confidence": float(probs[top])}
 
 
 def _row_for_step(step, sender_id, policy, obs, reward, info, action, extra):
@@ -127,23 +114,8 @@ class LiveSession:
         policy = self.policies[sender_id]
         obs = self._last_obs[sender_id]
         loss_pct = self._last_loss[sender_id]
-
-        if policy == "ppo":
-            action, probs, value = predict_with_distribution(self.model, obs)
-            extra = {"prob_decrease": probs[0], "prob_maintain": probs[1], "prob_increase": probs[2], "value_estimate": value}
-        elif policy == "hybrid":
-            action, blended_probs, _, tree_direction = predict_hybrid(self.model, self.regime_model, obs, loss_pct)
-            extra = {"prob_decrease": blended_probs[0], "prob_maintain": blended_probs[1], "prob_increase": blended_probs[2], "tree_direction": tree_direction}
-        elif policy == "cubic":
-            action, extra = 1, {}
-        elif policy == "human":
-            action, extra = human_actions_snapshot.get(sender_id, 1), {}
-        else:
-            raise ValueError(f"unknown policy {policy!r}")
-
-        if policy in ("ppo", "hybrid"):
-            extra.update(_regime_extra(self.regime_model, obs, loss_pct))
-        return action, extra
+        human_action = human_actions_snapshot.get(sender_id)
+        return resolve_action(policy, self.model, self.regime_model, obs, loss_pct, human_action=human_action)
 
     def _run(self):
         try:

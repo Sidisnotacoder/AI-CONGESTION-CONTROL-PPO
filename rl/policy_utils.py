@@ -83,3 +83,55 @@ def predict_hybrid(ppo_model, regime_model, obs, loss_pct, base_alpha=0.7):
 
     hybrid_action = int(np.argmax(blended_probs))
     return hybrid_action, blended_probs.tolist(), ppo_probs, tree_direction
+
+
+VALID_POLICIES = ("ppo", "hybrid", "cubic", "human")
+
+
+def regime_extra(regime_model, obs, loss_pct):
+    """Regime classifier's predicted class + confidence for a single
+    observation, or {} if no classifier is loaded (e.g. before
+    scripts/train_regime_classifier.py has run) -- shared by every
+    resolve_action() caller that wants to show/log it."""
+    if regime_model is None:
+        return {}
+    features = np.concatenate([np.asarray(obs, dtype=np.float32), [loss_pct]])
+    probs = regime_model.regime_probs(features)
+    top = int(np.argmax(probs))
+    return {"regime_predicted_class": regime_model.classes[top], "regime_confidence": float(probs[top])}
+
+
+def resolve_action(policy, model, regime_model, obs, loss_pct, human_action=None):
+    """Single shared per-sender policy dispatch: ppo/hybrid/cubic/human ->
+    (action, extra_info). Originally duplicated between
+    dashboard/live_session.py and env/competitive_congestion_env.py;
+    factored here for the same reason common/network.py consolidated
+    BottleneckTopo/parse_ss_output -- one place, not two that can drift.
+
+    extra_info carries whatever the caller might want to show or log
+    (action probabilities, critic value estimate, tree direction, regime
+    classification) -- callers that don't care (e.g. resolving an
+    opponent's action during RL training) can just ignore it.
+
+    human_action: the most recently received manual action for this
+    sender (already resolved by the caller -- this function doesn't know
+    about per-session human-action state), defaulting to 1 (maintain) if
+    none has been set yet.
+    """
+    if policy not in VALID_POLICIES:
+        raise ValueError(f"unknown policy {policy!r}, must be one of {VALID_POLICIES}")
+
+    if policy == "ppo":
+        action, probs, value = predict_with_distribution(model, obs)
+        extra = {"prob_decrease": probs[0], "prob_maintain": probs[1], "prob_increase": probs[2], "value_estimate": value}
+    elif policy == "hybrid":
+        action, blended_probs, _, tree_direction = predict_hybrid(model, regime_model, obs, loss_pct)
+        extra = {"prob_decrease": blended_probs[0], "prob_maintain": blended_probs[1], "prob_increase": blended_probs[2], "tree_direction": tree_direction}
+    elif policy == "cubic":
+        action, extra = 1, {}
+    else:  # human
+        action, extra = (human_action if human_action is not None else 1), {}
+
+    if policy in ("ppo", "hybrid"):
+        extra.update(regime_extra(regime_model, obs, loss_pct))
+    return action, extra
