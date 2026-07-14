@@ -1,0 +1,50 @@
+{
+  "old_solo_trained": {
+    "mixed_ppo": {
+      "rtt_ms": 1017.8525964842902,
+      "throughput_mbps": 2.0243111262718836,
+      "loss_pct": 0.11577372960863358,
+      "reward": -8.385762297788284
+    },
+    "mixed_cubic": {
+      "rtt_ms": 1024.4584594726564,
+      "throughput_mbps": 3.3743333319822946,
+      "loss_pct": 0.526532377386717,
+      "reward": -7.923316017517702
+    },
+    "homogeneous": {
+      "rtt_ms": 686.8232782920201,
+      "throughput_mbps": 2.3716833382844924,
+      "loss_pct": 0.08439724257365466,
+      "reward": -4.665343929783019
+    }
+  },
+  "new_competitive_trained": {
+    "mixed_ppo": {
+      "rtt_ms": 1137.4194623311362,
+      "throughput_mbps": 2.2057805755072173,
+      "loss_pct": 0.44445489064688926,
+      "reward": -10.057323829097921
+    },
+    "mixed_cubic": {
+      "rtt_ms": 1159.4901536305745,
+      "throughput_mbps": 2.657833327849706,
+      "loss_pct": 1.4422691620869916,
+      "reward": -11.821606532630023
+    },
+    "homogeneous": {
+      "rtt_ms": 1020.3075882673264,
+      "throughput_mbps": 2.3748875194539627,
+      "loss_pct": 0.07759162678825648,
+      "reward": -7.9833716167958135
+    }
+  },
+  "cubic_baseline": {
+    "homogeneous": {
+      "rtt_ms": 1237.925421857834,
+      "throughput_mbps": 2.358564583522578,
+      "loss_pct": 1.7429312371527927,
+      "reward": -13.506552109361346
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "rtt_ms": {
+    "ppo_agent": {
+      "mean": 235.0653688,
+      "ci95_low": 88.31742244471025,
+      "ci95_high": 381.81331515528973
+    },
+    "ppo_hybrid_tree": {
+      "mean": 153.1040112,
+      "ci95_low": 42.266639373884345,
+      "ci95_high": 263.94138302611566
+    },
+    "cubic_baseline": {
+      "mean": 333.74565199999995,
+      "ci95_low": 141.94637643697962,
+      "ci95_high": 525.5449275630203
+    },
+    "pairwise_welch_t_test": {
+      "ppo_agent_vs_ppo_hybrid_tree": {
+        "t": 1.2374059095318242,
+        "p": 0.2535470163807717
+      },
+      "ppo_agent_vs_cubic_baseline": {
+        "t": -1.134497556980778,
+        "p": 0.2915952963912639
+      },
+      "ppo_hybrid_tree_vs_cubic_baseline": {
+        "t": -2.2640738554069655,
+        "p": 0.061441341993060096
+      }
+    }
+  },
+  "throughput_mbps": {
+    "ppo_agent": {
+      "mean": 9.067198600000001,
+      "ci95_low": 8.805759419725009,
+      "ci95_high": 9.328637780274994
+    },
+    "ppo_hybrid_tree": {
+      "mean": 9.2188494,
+      "ci95_low": 9.16593859413162,
+      "ci95_high": 9.27176020586838
+    },
+    "cubic_baseline": {
+      "mean": 9.4493486,
+      "ci95_low": 9.318129220716672,
+      "ci95_high": 9.580567979283328
+    },
+    "pairwise_welch_t_test": {
+      "ppo_agent_vs_ppo_hybrid_tree": {
+        "t": -1.5785064094375587,
+        "p": 0.18422796853640677
+      },
+      "ppo_agent_vs_cubic_baseline": {
+        "t": -3.627144033368011,
+        "p": 0.011344943289383205
+      },
+      "ppo_hybrid_tree_vs_cubic_baseline": {
+        "t": -4.523215876446841,
+        "p": 0.005519405728740212
+      }
+    }
+  }
+}

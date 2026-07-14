@@ -1,0 +1,25 @@
+{
+  "env": "CompetitiveCongestionEnv (4-node Mininet, mixed ppo/hybrid/cubic opponents)",
+  "total_timesteps": 3000,
+  "n_steps": 256,
+  "batch_size": 64,
+  "opponent_compositions": [
+    [
+      "ppo",
+      "ppo",
+      "cubic"
+    ],
+    [
+      "hybrid",
+      "hybrid",
+      "cubic"
+    ],
+    [
+      "ppo",
+      "hybrid",
+      "cubic"
+    ]
+  ],
+  "timestamp_utc": "20260713T200226Z",
+  "git_commit": "cbd2af404084f1b7d8c2d1993b098833422b42ec"
+}
