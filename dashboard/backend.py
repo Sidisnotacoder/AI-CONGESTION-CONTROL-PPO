@@ -37,6 +37,13 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 REGIME_MODEL_PATH = "models/regime_classifier.joblib"
+# ppo_competitive.zip (trained with real competing traffic present, see
+# docs/COMPETITIVE_RETRAINING_STATUS.md) supersedes ppo_real_congestion.zip
+# (solo-trained only) as the live "ppo"/"hybrid" model -- same fixed-path
+# convention rl/model_registry.py already uses elsewhere: the fixed path is
+# always "whichever is current," with timestamped copies preserved for
+# history, not swapped into the live path.
+MODEL_PATH = "models/ppo_competitive"
 
 app = Flask(__name__, static_folder=None)
 _episode_lock = threading.Lock()
@@ -49,7 +56,7 @@ _session = None  # the one active LiveSession, or None between/before sessions
 def _get_model():
     global _model
     if _model is None:
-        _model = PPO.load("models/ppo_real_congestion")
+        _model = PPO.load(MODEL_PATH)
     return _model
 
 
